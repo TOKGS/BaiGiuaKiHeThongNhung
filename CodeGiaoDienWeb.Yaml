@@ -1,0 +1,151 @@
+esphome:
+  name: esp32-fire-safety
+  friendly_name: "NHÓM 11 - HỆ THỐNG BÁO CHÁY VÀ KHÍ ĐỘC"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+wifi:
+  ssid: "Mikehawk"
+  password: "typphono"
+
+logger:
+api:
+
+ota:
+  - platform: esphome
+
+web_server:
+  version: 3
+  port: 80
+
+# === UART2 tới STM32 (TX=GPIO17, RX=GPIO16) ===
+uart:
+  id: uart_stm
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 115200
+  rx_buffer_size: 512  
+
+text_sensor:
+  # 1) Đọc một DÒNG từ UART (kết thúc '\n'), ẩn khỏi UI
+  - platform: template
+    id: stm32_line
+    internal: true
+    update_interval: 50ms
+    lambda: |-
+      static std::string line;
+      // Hút hết byte đang có trong buffer UART, không gọi read_byte() nếu không có dữ liệu
+      while (id(uart_stm).available() > 0) {
+        uint8_t b;
+        id(uart_stm).read_byte(&b);
+        char ch = (char) b;
+        if (ch == '\n') {
+          // Trả về nguyên dòng (không gồm CR/LF)
+          auto out = line;
+          line.clear();
+          return out;
+        } else if (ch != '\r') {
+          line.push_back(ch);
+          if (line.size() > 160) line.clear();  // tránh kẹt nếu format sai
+        }
+      }
+      return {};   // không có dòng mới
+    on_value:
+      then:
+        - lambda: |-
+            // Dòng ví dụ: TEMP:29.50,ADC:521,TSTAT:1,GSTAT:0,FAN:0,DOOR:0
+            float temp; int adc, tstat, gstat, fan, door;
+            if (sscanf(x.c_str(),
+                       "TEMP:%f,ADC:%d,TSTAT:%d,GSTAT:%d,FAN:%d,DOOR:%d",
+                       &temp, &adc, &tstat, &gstat, &fan, &door) == 6) {
+              id(temp_c).publish_state(temp);
+              id(adc_raw).publish_state(adc);
+              id(fan_text).publish_state(fan ? "ON" : "OFF");
+              id(door_text).publish_state(door ? "OPEN" : "CLOSED");
+
+              const char* tdesc = (tstat == 2) ? "ALERT" : (tstat == 1 ? "ABN" : "NORMAL");
+              id(temp_status).publish_state(tdesc);
+
+              const char* gdesc = "CLEAN";
+              if      (gstat == 1) gdesc = "LEAK";
+              else if (gstat == 2) gdesc = "LPG";
+              else if (gstat == 3) gdesc = "SMOKE";
+              else if (gstat == 4) gdesc = "CO";
+              id(gas_status).publish_state(gdesc);
+            }
+
+             // --- Đọc countdown từ STM32 nếu có: ",REM:<giay>" ---
+            int rem = -1;
+            const char* pr = strstr(x.c_str(), "REM:");
+            if (pr) {
+            sscanf(pr, "REM:%d", &rem);
+            }
+            if (rem > 0) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "AUTO in: %ds", rem);
+            id(manual_timer).publish_state(buf);
+            } else {
+            id(manual_timer).publish_state("AUTO READY");
+            }
+
+  # 2) Các text sensor hiển thị trên UI
+  - platform: template
+    id: temp_status
+    name: "Temperature Status"
+    icon: mdi:thermometer-alert
+
+  - platform: template
+    id: gas_status
+    name: "Gas Status"
+    icon: mdi:gas-cylinder
+
+  - platform: template
+    id: fan_text
+    name: "Fan"
+    icon: mdi:fan
+
+  - platform: template
+    id: door_text
+    name: "Door"
+    icon: mdi:door
+
+  - platform: template
+    id: manual_timer
+    name: "Manual → Auto"
+    icon: mdi:timer-outline
+
+# === Nút điều khiển thủ công (gửi lệnh UART tới STM32) ===
+button:
+  - platform: template
+    name: "Fan Toggle"
+    on_press:
+      - uart.write:
+          id: uart_stm
+          data: "FAN TOG\n"
+
+  - platform: template
+    name: "Door Toggle"
+    on_press:
+      - uart.write:
+          id: uart_stm
+          data: "DOOR TOG\n"
+
+# === Các entity hiển thị trên UI ===
+sensor:
+  - platform: template
+    id: temp_c
+    name: "Temperature"
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer
+    accuracy_decimals: 2
+
+  - platform: template
+    id: adc_raw
+    name: "ADC"
+    unit_of_measurement: "ppm"
+    icon: mdi:gauge
+    accuracy_decimals: 0
+
